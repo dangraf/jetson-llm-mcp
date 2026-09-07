@@ -17,7 +17,7 @@ and `ollama.service` is enabled there, so it comes back on its own after a
 reboot:
 
 ```console
-$ ssh xavier@jetson-xav2 'systemctl is-enabled ollama; systemctl is-active ollama'
+$ ssh [name]@[host] 'systemctl is-enabled ollama; systemctl is-active ollama'
 enabled
 active
 ```
