@@ -28,9 +28,13 @@ THINKING_MODEL = "qwen3:30b-thinking"  # older, emits a chain of thought
 # because a bigger batch means a steeper current transient.
 #
 # On a healthy 19V/60W supply, measured on jetson-xav2 with qwen3.6:35b-a3b:
-#   30022 tokens in 32768 ctx, default batch -> 144 tok/s, peak draw 50.6W
-# Peaks reach 84% of a 60W supply, so keep an eye on the adapter rather than
-# on these constants if the machine starts dropping again.
+#   30022 tokens in 32768 ctx -> 144 tok/s, peak draw 50.6W  (84% of supply)
+#   60022 tokens in 65536 ctx -> 110 tok/s, peak draw 55.1W  (92% of supply)
+#
+# 65536 works and is allowed, but it is not the default: a full window holds
+# the board above 45W for a third of a nine-minute prefill, which leaves
+# almost no electrical margin — and vanished margin is what cost this machine
+# six power cycles. Ask for it explicitly when a long prompt earns it.
 NUM_CTX = 32768
 
 # A cold model costs ~30s or more to load; generation itself is quick.
