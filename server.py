@@ -20,21 +20,18 @@ DEFAULT_MODEL = "qwen3.6:35b-a3b"      # MoE, ~3B active params per token
 SMALL_MODEL = "qwen3.6:27b"            # dense, smaller memory footprint
 THINKING_MODEL = "qwen3:30b-thinking"  # older, emits a chain of thought
 
-# num_batch is not a tuning knob here, it is the difference between working
-# and taking the whole machine down. At ollama's default of 512, a prompt over
-# roughly 1000 tokens hard-hangs the Xavier: no OOM message, no thermal event,
-# no kernel log, the box simply stops answering ICMP and needs a power cycle.
-# System memory stays flat at ~6 GB free throughout, so the spike is not in
-# RAM — most likely the Tegra NvMap allocator, which hangs the SoC rather than
-# failing an allocation. At 128 the same prompts pass.
+# The shutdowns that drove these numbers down were electrical, not software.
+# The Jetson was on a tired 19V adapter that could not hold its rail through
+# the load step from ~4W idle to ~50W under prefill, and the board browned out
+# and switched itself off — no OOM, no thermal event, no kernel log, because
+# nothing in software was failing. num_batch looked like the culprit only
+# because a bigger batch means a steeper current transient.
 #
-# Measured end to end on jetson-xav2 with qwen3.6:35b-a3b at num_batch=128:
-#   1030 tokens in  8192 ctx ->  94 tok/s prefill
-#   3522 tokens in  4096 ctx -> 122 tok/s
-#   7522 tokens in  8192 ctx -> 126 tok/s   (nearly a full window)
-# Bigger contexts load fine but have not been proven with a long prompt.
-NUM_CTX = 8192
-NUM_BATCH = 128
+# On a healthy 19V/60W supply, measured on jetson-xav2 with qwen3.6:35b-a3b:
+#   30022 tokens in 32768 ctx, default batch -> 144 tok/s, peak draw 50.6W
+# Peaks reach 84% of a 60W supply, so keep an eye on the adapter rather than
+# on these constants if the machine starts dropping again.
+NUM_CTX = 32768
 
 # A cold model costs ~30s or more to load; generation itself is quick.
 TIMEOUT = 180
@@ -62,7 +59,7 @@ async def ask_jetson(
     qwen3.6 reasons by default and would spend the whole token budget
     thinking, so thinking is off unless you pass think=True — in which case
     give it a far larger max_tokens.
-    Prefill runs at ~120 tok/s, so a 7500-token prompt costs about a minute.
+    Prefill runs at ~144 tok/s, so a 30000-token prompt costs about 3 minutes.
     Use for: quick classifications, short code review, sanity checks.
     NOT for: long analysis or tasks Claude can handle directly.
     """
@@ -73,8 +70,7 @@ async def ask_jetson(
         "think": think,
         "options": {
             "num_predict": max(10, min(max_tokens, 400)),
-            "num_ctx": max(512, min(num_ctx, 16384)),
-            "num_batch": NUM_BATCH,
+            "num_ctx": max(512, min(num_ctx, 32768)),
         },
     }
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
