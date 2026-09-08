@@ -47,6 +47,37 @@ Flash attention is a prerequisite for the quantized cache.
 make every later pull of that blob fail instantly. That is what
 `fix-stuck-pull.sh` exists for.
 
+## Power comes first
+
+Before blaming software for an unstable Jetson, check the adapter. This one
+spent a day switching itself off under load — no OOM message, no thermal
+event, no kernel log — and every software explanation was wrong. A tired 19V
+adapter could not hold its rail through the load step from ~4W idle to ~50W
+once prefill started, so the board browned out. A healthy 19V/60W supply fixed
+it outright.
+
+The signature is worth recognising: the machine **powers off** rather than
+hanging. It stops answering ICMP even from the LAN, ARP goes INCOMPLETE, and
+you have to switch it on again rather than reboot it. A kernel that is merely
+starved still answers ping.
+
+Measured draw with qwen3.6:35b-a3b, at the default batch:
+
+| Load | Peak | Mean |
+| --- | --- | --- |
+| idle | 4 W | |
+| 30k tokens in 32k context | 50.6 W | 33.8 W |
+| 60k tokens in 64k context | 55.1 W | 40.4 W |
+
+The stock adapter is 65W at 19V and the board accepts 9-20V. A 60W supply
+works but leaves little margin at a full context window.
+
+`tegrastats` reports no power rails on this machine, because `nvphs` fails at
+boot. Read the INA3221 chips directly instead — `/sys/class/hwmon/hwmon*` with
+`name` of `ina3221`, multiplying `in<N>_input` by `curr<N>_input`. Root only.
+Sample at 20ms and fsync periodically to a file on disk: once a second is too
+coarse to see a load step, and anything buffered in RAM dies with the board.
+
 ## Platform ceiling
 
 Jetson AGX Xavier tops out at JetPack 5.1.5 / L4T 35.6.2 — JetPack 6 requires
