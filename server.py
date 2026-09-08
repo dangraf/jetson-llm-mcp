@@ -30,11 +30,15 @@ THINKING_MODEL = "qwen3:30b-thinking"  # older, emits a chain of thought
 # On a healthy 19V/60W supply, measured on jetson-xav2 with qwen3.6:35b-a3b:
 #   30022 tokens in 32768 ctx -> 144 tok/s, peak draw 50.6W  (84% of supply)
 #   60022 tokens in 65536 ctx -> 110 tok/s, peak draw 55.1W  (92% of supply)
+#  120022 tokens in 131072 ctx ->  74 tok/s, peak draw 58.0W  (97% of supply)
 #
-# 65536 works and is allowed, but it is not the default: a full window holds
-# the board above 45W for a third of a nine-minute prefill, which leaves
-# almost no electrical margin — and vanished margin is what cost this machine
-# six power cycles. Ask for it explicitly when a long prompt earns it.
+# 65536 is allowed but is not the default: a full window holds the board above
+# 45W for a third of a nine-minute prefill, which leaves little electrical
+# margin, and vanished margin is what cost this machine six power cycles.
+#
+# 131072 is deliberately beyond the cap. It works, but it sits at 97% of the
+# supply for 27 minutes and takes that long to produce a first token, which is
+# neither safe nor useful for a tool meant to answer quickly.
 NUM_CTX = 32768
 
 # A cold model costs ~30s or more to load; generation itself is quick.
@@ -74,7 +78,7 @@ async def ask_jetson(
         "think": think,
         "options": {
             "num_predict": max(10, min(max_tokens, 400)),
-            "num_ctx": max(512, min(num_ctx, 32768)),
+            "num_ctx": max(512, min(num_ctx, 65536)),
         },
     }
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
