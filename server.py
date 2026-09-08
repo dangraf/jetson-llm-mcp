@@ -1,12 +1,13 @@
 """Jetson LLM MCP server — exposes local Jetson models to Claude Code.
 
-Targets jetson-xav2, which runs a stock ollama install on port 11434.
-jetson-xav1 is deliberately not used: its deepseek-r1 models are older and
-slower (~1.4 tok/s via a hand-built llama-server), and the distilled qwen3
-models on xav2 outperform them at ~19 tok/s.
+Targets jetson-xav2, which runs ollama on port 11434.
 
-Only one 30b model fits in VRAM at a time — asking for a second one while
-another is loaded fails with "model failed to load".
+Uses ollama's native /api/chat rather than the OpenAI-compatible endpoint,
+because only the native API accepts `options`, and `num_ctx` is not optional
+here: ollama sizes the default context from total VRAM (32768) without
+subtracting the model weights. The Xavier shares one pool of memory between
+CPU and GPU, so 22 GB of weights plus a 32k KV cache exhausts the machine and
+takes it down hard. Every request below pins num_ctx.
 """
 
 import httpx
@@ -15,11 +16,15 @@ from mcp.server.fastmcp import FastMCP
 JETSON_HOST = "jetson-xav2"
 OLLAMA_PORT = 11434
 
-DEFAULT_MODEL = "qwen3-coder:30b"   # plain answers, no reasoning trace
-THINKING_MODEL = "qwen3:30b-thinking"
+DEFAULT_MODEL = "qwen3.6:35b-a3b"      # MoE, ~3B active params per token
+SMALL_MODEL = "qwen3.6:27b"            # dense, smaller memory footprint
+THINKING_MODEL = "qwen3:30b-thinking"  # older, emits a chain of thought
 
-# Warm generation is ~19 tok/s, but a cold model costs ~30s to load.
-TIMEOUT = 120
+# Keeps the KV cache small enough to leave the Xavier room to breathe.
+NUM_CTX = 4096
+
+# A cold model costs ~30s or more to load; generation itself is quick.
+TIMEOUT = 180
 
 mcp = FastMCP("jetson-llm")
 
@@ -33,13 +38,18 @@ async def ask_jetson(
     prompt: str,
     max_tokens: int = 150,
     model: str = DEFAULT_MODEL,
+    num_ctx: int = NUM_CTX,
+    think: bool = False,
 ) -> str:
     """
     Ask a local model on Jetson AGX Xavier (jetson-xav2, port 11434).
-    Speed: ~19 tok/s once warm; the first call after an idle period adds
-    ~30s of model loading. Default max_tokens=150.
-    Models: qwen3-coder:30b (default), qwen3:30b-thinking (shows reasoning).
-    Switching model evicts the loaded one — only one 30b fits in VRAM.
+    The first call after an idle period adds ~30s of model loading.
+    Models: qwen3.6:35b-a3b (default), qwen3.6:27b, qwen3:30b-thinking.
+    Switching model evicts the loaded one — only one fits in memory.
+    qwen3.6 reasons by default and would spend the whole token budget
+    thinking, so thinking is off unless you pass think=True — in which case
+    give it a far larger max_tokens.
+    Raise num_ctx only for long prompts; large values can exhaust the machine.
     Use for: quick classifications, short code review, sanity checks.
     NOT for: long analysis or tasks Claude can handle directly.
     """
@@ -47,28 +57,41 @@ async def ask_jetson(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "max_tokens": max(10, min(max_tokens, 400)),
+        "think": think,
+        "options": {
+            "num_predict": max(10, min(max_tokens, 400)),
+            "num_ctx": max(512, min(num_ctx, 16384)),
+        },
     }
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(_url("/v1/chat/completions"), json=payload)
+        r = await client.post(_url("/api/chat"), json=payload)
         r.raise_for_status()
         data = r.json()
 
-    if "error" in data:
-        return f"Jetson error: {data['error'].get('message', data['error'])}"
+        # Models without a reasoning mode reject the "think" key outright.
+        # Retry without it rather than failing a perfectly valid request.
+        if "error" in data and "think" in str(data["error"]).lower():
+            payload.pop("think")
+            r = await client.post(_url("/api/chat"), json=payload)
+            r.raise_for_status()
+            data = r.json()
 
-    choice = data["choices"][0]
-    message = choice["message"]
+    if "error" in data:
+        return f"Jetson error: {data['error']}"
+
+    message = data.get("message", {})
     content = (message.get("content") or "").strip()
 
     # Thinking models put the chain of thought in a separate field and leave
-    # content empty when max_tokens runs out mid-thought. Surface it rather
-    # than returning a silent empty string.
+    # content empty when the token budget runs out mid-thought. Surface it
+    # rather than returning a silent empty string. The native API calls it
+    # "thinking"; the OpenAI-compatible one calls it "reasoning".
     if not content:
-        reasoning = (message.get("reasoning") or "").strip()
-        if reasoning:
-            return f"[no answer — only reasoning, {choice['finish_reason']}]\n{reasoning}"
-        return f"[empty response from {model}, finish_reason={choice['finish_reason']}]"
+        thinking = (message.get("thinking") or message.get("reasoning") or "").strip()
+        reason = data.get("done_reason", "unknown")
+        if thinking:
+            return f"[no answer — only reasoning, {reason}]\n{thinking}"
+        return f"[empty response from {model}, done_reason={reason}]"
 
     return content
 
@@ -76,7 +99,7 @@ async def ask_jetson(
 @mcp.tool()
 async def check_jetson_status() -> str:
     """Check if the Jetson LLM service is online, which models are available,
-    and which one is currently loaded in VRAM."""
+    and which one is currently loaded in memory."""
     results = []
 
     async with httpx.AsyncClient(timeout=10) as client:
@@ -93,10 +116,10 @@ async def check_jetson_status() -> str:
             r = await client.get(_url("/api/ps"))
             r.raise_for_status()
             loaded = [
-                f"{m['name']} ({m['size_vram'] / 1e9:.1f} GB VRAM)"
+                f"{m['name']} ({m['size_vram'] / 1e9:.1f} GB, ctx={m.get('context_length')})"
                 for m in r.json().get("models", [])
             ]
-            results.append(f"loaded: {loaded or 'none — next call pays ~30s load'}")
+            results.append(f"loaded: {loaded or 'none — next call pays the load time'}")
         except Exception as e:
             results.append(f"loaded: unknown — {e}")
 
